@@ -1,390 +1,836 @@
+"""
+dashboard.py — Real-time Arduino LDR + LED Brightness Dashboard
+---------------------------------------------------------------
+Requirements:
+    pip install flask flask-socketio pyserial
+
+Run:
+    python dashboard.py --port COM3         (Windows)
+    python dashboard.py --port /dev/ttyACM0 (Linux/Mac)
+
+Then open:
+    http://localhost:5000
+
+This version matches the Arduino code:
+
+    const int ldrPin = A1;
+    const int ledPin = 5;
+    const int brightValue = 900;
+    const int darkStart = 400;
+    const int veryDark = 100;
+
+And reads serial lines in this format:
+    LDR: 356  Brightness: 37
+"""
+
+import argparse
+import re
+import threading
+import time
+from collections import deque
+from datetime import datetime
+
+import serial
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO
+
+# ── Config ────────────────────────────────────────────────────────────────────
+BAUD_RATE = 9600
+HISTORY_LEN = 120
+
+BRIGHT_VALUE = 900
+DARK_START = 400
+VERY_DARK = 100
+LED_PIN = 5
+LDR_PIN = "A1"
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "arduino-led-dashboard-secret"
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+history = deque(maxlen=HISTORY_LEN)
+latest = {}
+
+# ── HTML Dashboard ────────────────────────────────────────────────────────────
+DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Smart Street Light Dashboard</title>
-  <style>
-    :root{
-      --bg:#0f172a;
-      --panel:#1e293b;
-      --panel2:#334155;
-      --text:#f8fafc;
-      --muted:#cbd5e1;
-      --green:#22c55e;
-      --yellow:#f59e0b;
-      --red:#ef4444;
-      --blue:#38bdf8;
-      --border:#475569;
-      --shadow:0 8px 24px rgba(0,0,0,0.25);
-      --radius:16px;
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Street Light Dashboard</title>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0f1f;
+    --panel: #11182b;
+    --border: #21345e;
+    --accent: #00e5ff;
+    --accent2: #ffb703;
+    --green: #39ff14;
+    --red: #ff5a5f;
+    --text: #d7e3ff;
+    --dim: #6f86a8;
+    --blue: #60a5fa;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Exo 2', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,229,255,0.015) 2px,
+      rgba(0,229,255,0.015) 4px
+    );
+    pointer-events: none;
+    z-index: 100;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(90deg, #0a0f1f 0%, #0d1731 100%);
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .logo-icon {
+    width: 42px;
+    height: 42px;
+    border: 2px solid var(--accent);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 0 12px var(--accent);
+    font-size: 20px;
+  }
+
+  .logo h1 {
+    font-size: 1.2rem;
+    font-weight: 800;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  .logo span {
+    font-weight: 300;
+    color: var(--dim);
+    font-size: .8rem;
+    display: block;
+    letter-spacing: .12em;
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: .78rem;
+    font-family: 'Share Tech Mono', monospace;
+    letter-spacing: .08em;
+  }
+
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--dim);
+  }
+
+  .dot.live {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 1.4s infinite;
+  }
+
+  .dot.warn {
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+  }
+
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50% { opacity: .4; }
+  }
+
+  .timestamp {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: .78rem;
+    color: var(--dim);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    padding: 24px 28px;
+    max-width: 1450px;
+    margin: 0 auto;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .card::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: .6;
+  }
+
+  .card-label {
+    font-size: .7rem;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 10px;
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  .card-value {
+    font-size: 2.3rem;
+    font-weight: 800;
+    line-height: 1;
+    color: var(--accent);
+    font-family: 'Share Tech Mono', monospace;
+    text-shadow: 0 0 18px rgba(0,229,255,.25);
+  }
+
+  .card-unit {
+    font-size: .82rem;
+    color: var(--dim);
+    margin-top: 6px;
+  }
+
+  .card-sub {
+    font-size: .74rem;
+    color: var(--dim);
+    margin-top: 10px;
+    font-family: 'Share Tech Mono', monospace;
+    line-height: 1.5;
+  }
+
+  .gauge-wrap { margin-top: 14px; }
+
+  .gauge-track {
+    height: 7px;
+    background: var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .gauge-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #00e5ff, #39ff14);
+    transition: width .35s ease;
+    box-shadow: 0 0 10px rgba(0,229,255,.5);
+  }
+
+  .status-panel {
+    grid-column: span 2;
+  }
+
+  .led-panel {
+    grid-column: span 2;
+  }
+
+  .status-pill {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: .85rem;
+    font-family: 'Share Tech Mono', monospace;
+    letter-spacing: .05em;
+  }
+
+  .status-bright {
+    color: #39ff14;
+    border: 1px solid rgba(57,255,20,.4);
+    background: rgba(57,255,20,.08);
+  }
+
+  .status-dim {
+    color: #ffb703;
+    border: 1px solid rgba(255,183,3,.4);
+    background: rgba(255,183,3,.08);
+  }
+
+  .status-dark {
+    color: #ff5a5f;
+    border: 1px solid rgba(255,90,95,.4);
+    background: rgba(255,90,95,.08);
+  }
+
+  .led-wrap {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 170px;
+  }
+
+  .led-bulb {
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    background: #111827;
+    border: 3px solid #556987;
+    box-shadow: inset 0 0 24px rgba(255,255,255,.06);
+    transition: all .25s ease;
+  }
+
+  .thresholds {
+    grid-column: 1 / 5;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px;
+  }
+
+  .thresholds h3 {
+    font-size: .8rem;
+    color: var(--dim);
+    letter-spacing: .18em;
+    margin-bottom: 14px;
+    font-family: 'Share Tech Mono', monospace;
+    text-transform: uppercase;
+  }
+
+  .threshold-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+  }
+
+  .threshold-box {
+    background: #0d1425;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+
+  .threshold-box strong {
+    display: block;
+    font-size: .76rem;
+    color: var(--dim);
+    margin-bottom: 6px;
+    font-family: 'Share Tech Mono', monospace;
+    text-transform: uppercase;
+  }
+
+  .threshold-box span {
+    font-size: 1.2rem;
+    color: var(--accent);
+    font-family: 'Share Tech Mono', monospace;
+    font-weight: 700;
+  }
+
+  .chart-card {
+    grid-column: 1 / 5;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+    min-height: 280px;
+  }
+
+  .chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .chart-title {
+    font-size: .75rem;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--dim);
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  .chart-legend {
+    display: flex;
+    gap: 16px;
+    font-size: .74rem;
+    font-family: 'Share Tech Mono', monospace;
+    color: var(--text);
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .legend-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+  }
+
+  .log-card {
+    grid-column: 1 / 5;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: .74rem;
+    line-height: 1.7;
+    color: var(--dim);
+    overflow-y: auto;
+    max-height: 220px;
+  }
+
+  .log-title {
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+
+  .log-line { color: var(--text); }
+  .log-line span { color: var(--accent); }
+
+  @media (max-width: 1050px) {
+    .grid {
+      grid-template-columns: repeat(2, 1fr);
     }
 
-    *{
-      box-sizing:border-box;
-      margin:0;
-      padding:0;
-      font-family:Arial, Helvetica, sans-serif;
+    .status-panel,
+    .led-panel,
+    .thresholds,
+    .chart-card,
+    .log-card {
+      grid-column: 1 / 3;
     }
 
-    body{
-      background:linear-gradient(135deg,#020617,#0f172a,#1e293b);
-      color:var(--text);
-      min-height:100vh;
-      padding:24px;
+    .threshold-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (max-width: 650px) {
+    .grid {
+      grid-template-columns: 1fr;
+      padding: 18px;
     }
 
-    .container{
-      max-width:1100px;
-      margin:0 auto;
+    .status-panel,
+    .led-panel,
+    .thresholds,
+    .chart-card,
+    .log-card {
+      grid-column: 1 / 2;
     }
 
-    .title{
-      margin-bottom:20px;
+    .threshold-grid {
+      grid-template-columns: 1fr;
     }
 
-    .title h1{
-      font-size:2rem;
-      margin-bottom:6px;
+    .card-value {
+      font-size: 1.8rem;
     }
-
-    .title p{
-      color:var(--muted);
-      font-size:1rem;
-    }
-
-    .grid{
-      display:grid;
-      grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
-      gap:18px;
-      margin-bottom:20px;
-    }
-
-    .card{
-      background:rgba(30,41,59,0.92);
-      border:1px solid var(--border);
-      border-radius:var(--radius);
-      padding:20px;
-      box-shadow:var(--shadow);
-    }
-
-    .card h2{
-      font-size:1rem;
-      color:var(--muted);
-      margin-bottom:12px;
-    }
-
-    .big-value{
-      font-size:2.2rem;
-      font-weight:700;
-    }
-
-    .sub{
-      margin-top:8px;
-      color:var(--muted);
-      font-size:0.95rem;
-    }
-
-    .status-pill{
-      display:inline-block;
-      margin-top:10px;
-      padding:8px 14px;
-      border-radius:999px;
-      font-weight:700;
-      font-size:0.95rem;
-    }
-
-    .status-bright{
-      background:rgba(34,197,94,0.15);
-      color:var(--green);
-      border:1px solid rgba(34,197,94,0.45);
-    }
-
-    .status-dim{
-      background:rgba(245,158,11,0.15);
-      color:var(--yellow);
-      border:1px solid rgba(245,158,11,0.45);
-    }
-
-    .status-dark{
-      background:rgba(239,68,68,0.15);
-      color:#fca5a5;
-      border:1px solid rgba(239,68,68,0.45);
-    }
-
-    .bar-wrap{
-      margin-top:14px;
-      background:#0f172a;
-      border-radius:999px;
-      height:18px;
-      overflow:hidden;
-      border:1px solid var(--border);
-    }
-
-    .bar{
-      height:100%;
-      width:0%;
-      background:linear-gradient(90deg,var(--blue),#60a5fa);
-      transition:width 0.25s ease;
-    }
-
-    .led-visual-wrap{
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      min-height:180px;
-    }
-
-    .led-bulb{
-      width:110px;
-      height:110px;
-      border-radius:50%;
-      background:#111827;
-      border:3px solid #64748b;
-      box-shadow:inset 0 0 20px rgba(255,255,255,0.05);
-      transition:all 0.25s ease;
-    }
-
-    .section{
-      margin-top:20px;
-    }
-
-    .logic-table{
-      width:100%;
-      border-collapse:collapse;
-      overflow:hidden;
-      border-radius:14px;
-    }
-
-    .logic-table th,
-    .logic-table td{
-      padding:14px;
-      text-align:left;
-      border-bottom:1px solid var(--border);
-      background:rgba(30,41,59,0.92);
-    }
-
-    .logic-table th{
-      color:var(--muted);
-      font-size:0.95rem;
-    }
-
-    .controls{
-      display:flex;
-      flex-direction:column;
-      gap:12px;
-    }
-
-    .controls label{
-      font-weight:700;
-      color:var(--muted);
-    }
-
-    input[type="range"]{
-      width:100%;
-    }
-
-    .small-note{
-      color:var(--muted);
-      font-size:0.92rem;
-      margin-top:10px;
-      line-height:1.5;
-    }
-
-    .pin-box{
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      margin-top:10px;
-    }
-
-    .pin{
-      padding:8px 12px;
-      border-radius:10px;
-      background:#0f172a;
-      border:1px solid var(--border);
-      color:var(--text);
-      font-weight:700;
-    }
-
-    @media (max-width:700px){
-      .title h1{
-        font-size:1.6rem;
-      }
-      .big-value{
-        font-size:1.8rem;
-      }
-    }
-  </style>
+  }
+</style>
 </head>
 <body>
-  <div class="container">
-    <div class="title">
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">💡</div>
+    <div>
       <h1>Smart Street Light Dashboard</h1>
-      <p>Dashboard matched to the Arduino Uno script for the photoresistor and PWM LED brightness control.</p>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h2>Photoresistor Reading</h2>
-        <div class="big-value" id="ldrValue">900</div>
-        <div class="sub">Analog input from <strong>A1</strong></div>
-        <div class="bar-wrap">
-          <div class="bar" id="ldrBar"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>LED Brightness</h2>
-        <div class="big-value" id="brightnessValue">0</div>
-        <div class="sub">PWM output on <strong>Pin 5</strong> (0–255)</div>
-        <div class="bar-wrap">
-          <div class="bar" id="brightnessBar"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Lighting Status</h2>
-        <div class="big-value" id="statusText">Bright</div>
-        <div class="status-pill status-bright" id="statusPill">LED OFF</div>
-        <div class="sub">Uses the same thresholds as the Arduino code</div>
-      </div>
-
-      <div class="card">
-        <h2>System Pins</h2>
-        <div class="pin-box">
-          <div class="pin">LDR: A1</div>
-          <div class="pin">LED: 5</div>
-          <div class="pin">Bright: 900</div>
-          <div class="pin">Dark Start: 400</div>
-          <div class="pin">Very Dark: 100</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h2>LED Visual Output</h2>
-        <div class="led-visual-wrap">
-          <div class="led-bulb" id="ledBulb"></div>
-        </div>
-        <div class="small-note">
-          This visual circle changes intensity to represent the brightness value being sent to the LED using PWM.
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Manual Sensor Test</h2>
-        <div class="controls">
-          <label for="ldrSlider">Simulated LDR Value: <span id="sliderOutput">900</span></label>
-          <input type="range" id="ldrSlider" min="0" max="1023" value="900">
-        </div>
-        <div class="small-note">
-          Move the slider to simulate the photoresistor.  
-          This follows the same logic as your Arduino script:
-          above 400 = LED off, between 400 and 100 = gradual increase, 100 or below = maximum brightness.
-        </div>
-      </div>
-    </div>
-
-    <div class="section">
-      <table class="logic-table">
-        <thead>
-          <tr>
-            <th>LDR Range</th>
-            <th>Condition</th>
-            <th>LED Behaviour</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>400 and above</td>
-            <td>Bright environment</td>
-            <td>LED OFF (brightness = 0)</td>
-          </tr>
-          <tr>
-            <td>101 to 399</td>
-            <td>Medium / getting dark</td>
-            <td>LED gradually increases using map()</td>
-          </tr>
-          <tr>
-            <td>100 or below</td>
-            <td>Very dark</td>
-            <td>LED at maximum brightness (255)</td>
-          </tr>
-        </tbody>
-      </table>
+      <span>Arduino Uno · LDR on A1 · PWM LED on Pin 5</span>
     </div>
   </div>
 
-  <script>
-    const darkStart = 400;
-    const veryDark = 100;
+  <div class="header-right">
+    <div class="status-badge">
+      <div class="dot" id="liveDot"></div>
+      <span id="connectionText">CONNECTING</span>
+    </div>
+    <div class="timestamp" id="clock">--:--:--</div>
+  </div>
+</header>
 
-    const ldrSlider = document.getElementById("ldrSlider");
-    const sliderOutput = document.getElementById("sliderOutput");
+<div class="grid">
 
-    const ldrValueEl = document.getElementById("ldrValue");
-    const brightnessValueEl = document.getElementById("brightnessValue");
-    const statusTextEl = document.getElementById("statusText");
-    const statusPillEl = document.getElementById("statusPill");
-    const ldrBar = document.getElementById("ldrBar");
-    const brightnessBar = document.getElementById("brightnessBar");
-    const ledBulb = document.getElementById("ledBulb");
+  <div class="card">
+    <div class="card-label">LDR Reading</div>
+    <div class="card-value" id="ldrVal">—</div>
+    <div class="card-unit">analog value (0–1023)</div>
+    <div class="gauge-wrap">
+      <div class="gauge-track"><div class="gauge-fill" id="ldrGauge"></div></div>
+    </div>
+    <div class="card-sub" id="ldrSub">Photoresistor input from A1</div>
+  </div>
 
-    function mapValue(x, inMin, inMax, outMin, outMax) {
-      return Math.round((x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin);
+  <div class="card">
+    <div class="card-label">LED Brightness</div>
+    <div class="card-value" id="brightnessVal">—</div>
+    <div class="card-unit">PWM value (0–255)</div>
+    <div class="gauge-wrap">
+      <div class="gauge-track"><div class="gauge-fill" id="brightnessGauge"></div></div>
+    </div>
+    <div class="card-sub" id="brightnessSub">PWM output on pin 5</div>
+  </div>
+
+  <div class="card">
+    <div class="card-label">Voltage Estimate</div>
+    <div class="card-value" id="voltageVal">—</div>
+    <div class="card-unit">volts (0–5 V)</div>
+    <div class="gauge-wrap">
+      <div class="gauge-track"><div class="gauge-fill" id="voltageGauge"></div></div>
+    </div>
+    <div class="card-sub" id="voltageSub">Calculated from LDR reading</div>
+  </div>
+
+  <div class="card">
+    <div class="card-label">Sample Count</div>
+    <div class="card-value" id="sampleCount">0</div>
+    <div class="card-unit">serial updates received</div>
+    <div class="card-sub" id="lastUpdate">Last update: —</div>
+  </div>
+
+  <div class="card status-panel">
+    <div class="card-label">Lighting State</div>
+    <div class="card-value" id="stateText">—</div>
+    <div class="status-pill status-bright" id="statePill">WAITING</div>
+    <div class="card-sub" id="logicText">
+      Based on Arduino logic:
+      LDR ≥ 400 → OFF,
+      101–399 → gradual increase,
+      ≤ 100 → max brightness
+    </div>
+  </div>
+
+  <div class="card led-panel">
+    <div class="card-label">LED Visual Output</div>
+    <div class="led-wrap">
+      <div class="led-bulb" id="ledBulb"></div>
+    </div>
+    <div class="card-sub">This visual represents the PWM brightness being sent to the LED.</div>
+  </div>
+
+  <div class="thresholds">
+    <h3>Arduino Thresholds</h3>
+    <div class="threshold-grid">
+      <div class="threshold-box">
+        <strong>LDR Pin</strong>
+        <span>A1</span>
+      </div>
+      <div class="threshold-box">
+        <strong>LED Pin</strong>
+        <span>5</span>
+      </div>
+      <div class="threshold-box">
+        <strong>Bright Value</strong>
+        <span>900</span>
+      </div>
+      <div class="threshold-box">
+        <strong>Dark Start</strong>
+        <span>400</span>
+      </div>
+      <div class="threshold-box">
+        <strong>Very Dark</strong>
+        <span>100</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-header">
+      <span class="chart-title">Live History</span>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#00e5ff"></div>LDR</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ffb703"></div>Brightness</div>
+      </div>
+    </div>
+    <canvas id="sensorChart" height="180"></canvas>
+  </div>
+
+  <div class="log-card" id="logBox">
+    <div class="log-title">// Serial log</div>
+  </div>
+
+</div>
+
+<script>
+const socket = io();
+let samples = 0;
+
+setInterval(() => {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('en-GB');
+}, 1000);
+
+const ctx = document.getElementById('sensorChart').getContext('2d');
+const MAX_POINTS = 120;
+
+const chartData = {
+  labels: [],
+  datasets: [
+    {
+      label: 'LDR',
+      data: [],
+      borderColor: '#00e5ff',
+      backgroundColor: 'rgba(0,229,255,0.08)',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0.35,
+      fill: true,
+    },
+    {
+      label: 'Brightness',
+      data: [],
+      borderColor: '#ffb703',
+      backgroundColor: 'rgba(255,183,3,0.06)',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0.35,
+      fill: true,
     }
+  ]
+};
 
-    function updateDashboard(ldrValue) {
-      let brightness = 0;
-      let statusText = "";
-      let pillText = "";
-      let pillClass = "";
-
-      if (ldrValue >= darkStart) {
-        brightness = 0;
-        statusText = "Bright";
-        pillText = "LED OFF";
-        pillClass = "status-bright";
-      } else if (ldrValue < darkStart && ldrValue > veryDark) {
-        brightness = mapValue(ldrValue, darkStart, veryDark, 0, 255);
-        statusText = "Getting Dark";
-        pillText = "LED DIMMING UP";
-        pillClass = "status-dim";
-      } else if (ldrValue <= veryDark) {
-        brightness = 255;
-        statusText = "Very Dark";
-        pillText = "MAX BRIGHTNESS";
-        pillClass = "status-dark";
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: chartData,
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: {
+        ticks: {
+          color: '#6f86a8',
+          font: { family: 'Share Tech Mono', size: 10 },
+          maxTicksLimit: 10
+        },
+        grid: { color: 'rgba(33,52,94,.6)' }
+      },
+      y: {
+        min: 0,
+        max: 1023,
+        ticks: {
+          color: '#6f86a8',
+          font: { family: 'Share Tech Mono', size: 10 }
+        },
+        grid: { color: 'rgba(33,52,94,.6)' }
       }
-
-      ldrValueEl.textContent = ldrValue;
-      brightnessValueEl.textContent = brightness;
-      statusTextEl.textContent = statusText;
-      sliderOutput.textContent = ldrValue;
-
-      statusPillEl.textContent = pillText;
-      statusPillEl.className = "status-pill " + pillClass;
-
-      ldrBar.style.width = `${(ldrValue / 1023) * 100}%`;
-      brightnessBar.style.width = `${(brightness / 255) * 100}%`;
-
-      const glow = brightness / 255;
-      ledBulb.style.background = `rgba(255, 255, 180, ${0.08 + glow})`;
-      ledBulb.style.boxShadow = `
-        0 0 ${10 + glow * 50}px rgba(255, 255, 150, ${0.2 + glow * 0.8}),
-        0 0 ${20 + glow * 80}px rgba(255, 230, 120, ${0.1 + glow * 0.6}),
-        inset 0 0 20px rgba(255,255,255,0.15)
-      `;
-      ledBulb.style.borderColor = glow > 0 ? "#facc15" : "#64748b";
+    },
+    plugins: {
+      legend: { display: false }
     }
+  }
+});
 
-    ldrSlider.addEventListener("input", () => {
-      updateDashboard(parseInt(ldrSlider.value));
-    });
+function pushChart(ts, ldr, brightnessScaled) {
+  if (chartData.labels.length >= MAX_POINTS) {
+    chartData.labels.shift();
+    chartData.datasets[0].data.shift();
+    chartData.datasets[1].data.shift();
+  }
 
-    updateDashboard(parseInt(ldrSlider.value));
-  </script>
+  chartData.labels.push(ts);
+  chartData.datasets[0].data.push(ldr);
+  chartData.datasets[1].data.push(brightnessScaled);
+  chart.update('none');
+}
+
+socket.on('connect', () => {
+  document.getElementById('liveDot').className = 'dot live';
+  document.getElementById('connectionText').textContent = 'LIVE';
+});
+
+socket.on('disconnect', () => {
+  document.getElementById('liveDot').className = 'dot warn';
+  document.getElementById('connectionText').textContent = 'DISCONNECTED';
+});
+
+socket.on('sensor_data', (d) => {
+  samples++;
+
+  const ts = new Date().toLocaleTimeString('en-GB');
+  const voltage = (d.ldr / 1023) * 5.0;
+  const brightnessPercent = (d.brightness / 255) * 100;
+  const brightnessScaled = (d.brightness / 255) * 1023;
+
+  document.getElementById('ldrVal').textContent = d.ldr;
+  document.getElementById('brightnessVal').textContent = d.brightness;
+  document.getElementById('voltageVal').textContent = voltage.toFixed(2);
+  document.getElementById('sampleCount').textContent = samples;
+  document.getElementById('lastUpdate').textContent = `Last update: ${ts}`;
+
+  document.getElementById('ldrGauge').style.width = `${(d.ldr / 1023) * 100}%`;
+  document.getElementById('brightnessGauge').style.width = `${brightnessPercent}%`;
+  document.getElementById('voltageGauge').style.width = `${(voltage / 5) * 100}%`;
+
+  document.getElementById('ldrSub').textContent = `A1 input • ${(d.ldr / 1023 * 100).toFixed(1)}% of full scale`;
+  document.getElementById('brightnessSub').textContent = `Pin 5 PWM • ${brightnessPercent.toFixed(1)}% brightness`;
+  document.getElementById('voltageSub').textContent = `${voltage.toFixed(3)} V estimated from LDR reading`;
+
+  const stateText = document.getElementById('stateText');
+  const statePill = document.getElementById('statePill');
+
+  if (d.ldr >= 400) {
+    stateText.textContent = 'Bright';
+    statePill.textContent = 'LED OFF';
+    statePill.className = 'status-pill status-bright';
+  } else if (d.ldr > 100) {
+    stateText.textContent = 'Getting Dark';
+    statePill.textContent = 'LED DIMMING UP';
+    statePill.className = 'status-pill status-dim';
+  } else {
+    stateText.textContent = 'Very Dark';
+    statePill.textContent = 'MAX BRIGHTNESS';
+    statePill.className = 'status-pill status-dark';
+  }
+
+  const glow = d.brightness / 255;
+  const ledBulb = document.getElementById('ledBulb');
+  ledBulb.style.background = `rgba(255, 245, 180, ${0.08 + glow})`;
+  ledBulb.style.boxShadow = `
+    0 0 ${10 + glow * 45}px rgba(255, 240, 120, ${0.18 + glow * 0.75}),
+    0 0 ${20 + glow * 80}px rgba(255, 220, 90, ${0.12 + glow * 0.55}),
+    inset 0 0 20px rgba(255,255,255,0.15)
+  `;
+  ledBulb.style.borderColor = glow > 0 ? '#ffd166' : '#556987';
+
+  pushChart(ts, d.ldr, brightnessScaled);
+
+  const log = document.getElementById('logBox');
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  line.innerHTML = `<span>${ts}</span>  LDR=${String(d.ldr).padStart(4)}  BRIGHTNESS=${String(d.brightness).padStart(3)}  VOLT=${voltage.toFixed(3)}V`;
+  log.appendChild(line);
+
+  if (log.children.length > 30) {
+    log.removeChild(log.children[1]);
+  }
+
+  log.scrollTop = log.scrollHeight;
+});
+</script>
 </body>
 </html>
+"""
+
+# ── Flask Route ───────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML)
+
+# ── Serial Parsing ────────────────────────────────────────────────────────────
+SERIAL_PATTERN = re.compile(
+    r"LDR:\s*(\d+)\s+Brightness:\s*(\d+)",
+    re.IGNORECASE
+)
+
+def parse_serial_line(line: str):
+    """
+    Expected line format:
+        LDR: 356  Brightness: 37
+    """
+    match = SERIAL_PATTERN.search(line)
+    if not match:
+        return None
+
+    ldr = int(match.group(1))
+    brightness = int(match.group(2))
+
+    return {
+        "ldr": ldr,
+        "brightness": brightness,
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ── Serial Reader Thread ──────────────────────────────────────────────────────
+def serial_reader(port: str):
+    print(f"[serial] Connecting to {port} @ {BAUD_RATE} baud...")
+
+    while True:
+        try:
+            with serial.Serial(port, BAUD_RATE, timeout=2) as ser:
+                print("[serial] Connected ✓")
+                ser.reset_input_buffer()
+
+                while True:
+                    raw_line = ser.readline().decode("utf-8", errors="ignore").strip()
+
+                    if not raw_line:
+                        continue
+
+                    data = parse_serial_line(raw_line)
+                    if data is None:
+                        continue
+
+                    history.append(data)
+                    socketio.emit("sensor_data", data)
+
+        except serial.SerialException as e:
+            print(f"[serial] Error: {e} — retrying in 3 seconds...")
+            time.sleep(3)
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Arduino Smart Street Light Dashboard")
+    parser.add_argument("--port", default="COM3", help="Serial port, e.g. COM3 or /dev/ttyACM0")
+    parser.add_argument("--host", default="0.0.0.0", help="Host address for Flask")
+    parser.add_argument("--webport", default=5000, type=int, help="Web dashboard port")
+    args = parser.parse_args()
+
+    t = threading.Thread(target=serial_reader, args=(args.port,), daemon=True)
+    t.start()
+
+    print(f"[web] Dashboard running at http://localhost:{args.webport}")
+    socketio.run(app, host=args.host, port=args.webport, debug=False)
