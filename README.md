@@ -1,6 +1,6 @@
 # Arduino IoT Light Sensor Dashboard
 
-Real-time monitoring of a photodiode connected to an Arduino Uno,
+Real-time monitoring of a photodiode connected to an Arduino Nano,
 displayed on a live web dashboard via Python + Flask-SocketIO.
 
 ---
@@ -10,7 +10,7 @@ displayed on a live web dashboard via Python + Flask-SocketIO.
 ### Components
 | Component       | Qty |
 |-----------------|-----|
-| Arduino Uno     | 1   |
+| Arduino Nano     | 1   |
 | Photodiode      | 1   |
 | LED (any colour)| 1   |
 | Resistor 10 kΩ  | 1   | ← pull-down for photodiode

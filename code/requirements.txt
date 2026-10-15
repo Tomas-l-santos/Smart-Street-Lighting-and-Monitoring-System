@@ -1,4 +1,0 @@
-# Python dependencies
-flask>=3.0
-flask-socketio>=5.3
-pyserial>=3.5
